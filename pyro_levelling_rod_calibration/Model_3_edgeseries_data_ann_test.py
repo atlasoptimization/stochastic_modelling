@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-The goal of this script is to perform levelling rod calibration with edgeseries
-data. For this, we import synthetically generated data and use it to train a 
-probabilistic model that involves latent per-staff variables and a generative 
-process metadist -> perstaff latent -> edgeseries.
+The goal of this script is to test if the tilt_ann can recuperate nonlinear effects
+given different net architectures. This amounts to a very reduced levelling rod
+calibration with edgeseries data. For this, we import synthetically generated data
+and use it to train a probabilistic model that abstra ts away most of the complexities
+of model_3.
 For this, do the following:
     1. Imports and definitions
     2. Support functions
@@ -43,132 +44,40 @@ import arviz as az
 from pathlib import Path
 
 
-# ii) Import and format data
+# ii) Definitions
 
-with open("../data_stochastic_modelling/data_levelling_rod_calibration/synthetic_data_list_edgeseries.pkl", "rb") as f:
-    data_list = pickle.load(f)
+n_tilt_types = 2
+n_edge_max = 89
+n_rods = 100
+n_datapoints = 2*n_rods
 
-# Sort data_list according to staff_ids
-data_list = sorted(data_list, key=lambda d: d['staff_id'])
-
-# make input vars into a data list that contains metainfo on each datapoint
-
-def dropped_copy(list_of_dicts, key_list):
-    keys = set(key_list)
-    return [
-        {k: v for k, v in d.items() if k not in keys}
-        for d in list_of_dicts
-    ]
-
-gt_alpha = [torch.hstack((datapoint['gt_offset'], datapoint['gt_scale'])) 
-            for datapoint in data_list]
-gt_tilt = [datapoint['gt_tiltseries'] for datapoint in data_list]
-input_vars = dropped_copy(data_list, ['gt_offset', 'gt_scale', 'gt_tiltseries'])
-
-observations = torch.vstack([datapoint['edgeseries'].unsqueeze(0) for datapoint in data_list])
-n_obs = len(data_list)
-
-
-# iii) Metadistribution for staff class alpha
-
-
+x = (1/n_edge_max)*torch.arange(0, n_edge_max)
+input_vars = [x for k in range(n_rods)]
 
 
 """
-    2. Support functions
+    2. Build simple dataset
 """
 
+# observations will be one edgeseries 
 
-# i) Recompile info along job nr
-job_nr_perjob = [input_var['job_nr'] for input_var in input_vars]
-staff_id_perjob = [input_var['staff_id'] for input_var in input_vars]
-staff_type_perjob = [input_var['staff_type_reduced'] for input_var in input_vars]
-tilt_type_perjob = [input_var['tilt_type'] for input_var in input_vars]
-edgeseries_perjob = [input_var['edgeseries'] for input_var in input_vars]
-n_edge_perjob = [(~torch.isnan(input_var['edgeseries'])).sum() for input_var in input_vars]
+# i) Tilt types data
 
+tilt_types_perstaff = [torch.tensor([0.0, 1.0]) for k in range(n_rods)]
+input_data = [{'x': x, 'tilt_type': tilt_types_perstaff[k]} for k in range(n_rods)]
+tilt_gt_0 = 10*x**2
+tilt_gt_1 = 10 +10*x - 10*x**2
+tilt_gt = [[tilt_gt_0, tilt_gt_1] for k in range(n_rods)]
 
+tilt_types_perobs = [torch.tensor([0.0]) for k in range(n_rods)] + [torch.tensor([1.0]) for k in range(n_rods)]
+tilt_gt_perobs = [tilt_gt_0 for k in range(n_rods)] + [tilt_gt_1 for k in range(n_rods)] 
 
-# ii) Recompile info along rod ids
-staff_list = list(set([input_var['staff_id'] for input_var in input_vars]))
-n_meas_perstaff = [ sum(1 for iv in input_vars if iv['staff_id'] == sid)
-    for sid in staff_list]
-staff_type_perstaff = [ [iv['staff_type_reduced'] for iv in input_vars if iv['staff_id'] == sid][0]
-    for sid in staff_list]
-n_edge_perstaff = [ [torch.sum(~torch.isnan(iv['edgeseries'])) for iv in input_vars if iv['staff_id'] == sid][0]
-    for sid in staff_list]
-staff_len_perstaff = [ [iv['staff_len'] for iv in input_vars if iv['staff_id'] == sid][0]
-    for sid in staff_list]
-tilt_type_perstaff = [ [iv['tilt_type'] for iv in input_vars if iv['staff_id'] == sid]
-    for sid in staff_list]
-job_nr_perstaff = [ [iv['job_nr'] for iv in input_vars if iv['staff_id'] == sid]
-    for sid in staff_list]
-
-# Derived quantities
-n_staff = len(staff_list)
-n_types = len(set(staff_type_perstaff))
-tilt_types = torch.unique(torch.stack(tilt_type_perjob))
-n_tilt_types = len(tilt_types)
-
-# Extract some lengths adn setup masks
-n_meas_max = max(n_meas_perstaff)
-n_edge_max = max(n_edge_perjob)
-
-
-
-# iii) Get unique staff types and build obs -> class index tensor
-unique_types = sorted(set(staff_type_perstaff))
-type_to_color = {stype: plt.cm.tab10(i % 10) for i, stype in enumerate(unique_types)}
-type_to_index = {stype: i for i, stype in enumerate(unique_types)}
-index_to_type = {i: stype for i, stype in enumerate(unique_types)}
-obs_class_indices = torch.tensor([type_to_index[staff_type] for staff_type in staff_type_perjob])
-
-# iv) Get unique rod ids and build obs -> id index tensor
-unique_ids = sorted(set(staff_id_perjob))
-obs_id_indices = torch.tensor(staff_id_perjob)
-id_class_indices_dict = {}               # {staff_id: class_idx}
-for row in input_vars:            
-    sid  = row["staff_id"]
-    cidx = type_to_index[row["staff_type_reduced"]]
-    id_class_indices_dict[sid] = cidx  
-id_class_indices_dict = dict(sorted(id_class_indices_dict.items()))
-
-# Build id -> class indextensor
-n_ids = max(id_class_indices_dict) +1       # assuming staff_id starts at 0 and is dense
-id_class_indices = torch.empty(n_ids, dtype=torch.long)
-for sid, cidx in id_class_indices_dict.items():
-    id_class_indices[sid] = cidx
-    
-# Build obs indx -> job_nr
-obsnr_to_jobnr_dict = {}
-jobnr_to_obsnr_dict = {}
-for i in range(n_obs):
-    obsnr_to_jobnr_dict[i] = job_nr_perjob[i]
-    jobnr_to_obsnr_dict[job_nr_perjob[i]] = i
-    
-obsnr_perstaff = [[jobnr_to_obsnr_dict[jobnr] for jobnr in jobnr_list] for jobnr_list in job_nr_perstaff]
-# obsnr_to_index = {}
-# for k in range(n_obs):
-#     obsnr = k
-#     jobnr = obsnr_to_jobnr_dict[k]
-#     staff_id = staff_id_perjob[k]
-#     obsnr_to_index[k] = staff_id
-obs_idx_lookup = [None] * n_obs
-
-# Fill in the inverse map
-for staff_idx, obs_list in enumerate(obsnr_perstaff):
-    for obs_idx_in_staff, obs in enumerate(obs_list):
-        obs_idx_lookup[obs] = [staff_idx, obs_idx_in_staff]
-        
-        
-# Build an extended tensor including nans
-observations_extended = torch.full((n_staff, n_meas_max, n_edge_max), float('nan'),
-                                   dtype=observations.dtype,
-                                   device=observations.device)
-for obs_idx, (staff_idx, meas_idx) in enumerate(obs_idx_lookup):
-    observations_extended[staff_idx, meas_idx, :] = observations[obs_idx]
-observations_extended = observations_extended.reshape([-1, n_edge_max])
-
+# observations are just one edgeseries per datapoint
+noise_dist = pyro.distributions.Normal(0,1)
+observations_perstaff = [[tilt_gt_0 + noise_dist.sample([n_edge_max]), 
+                 tilt_gt_1 + noise_dist.sample([n_edge_max])] for k in range(n_rods)] 
+observations = ([observations_perstaff[k][0] for k in range(n_rods)] 
+                    + [observations_perstaff[k][1] for k in range(n_rods)])
 
 
 """
@@ -179,22 +88,11 @@ observations_extended = observations_extended.reshape([-1, n_edge_max])
 # i) Tilt model - ANN
 
 class ANN(torch.nn.Module):
-    # Will putput a different edge series based on input tilt type.
+    # Will output a different edge series based on input tilt type.
     def __init__(self):
         # Initialize instance using init method from base class
         super().__init__()
-                
-        # # Linear layers
-        # self.lin_1 = torch.nn.Linear(1,16)
-        # self.lin_2 = torch.nn.Linear(16,16)
-        # self.lin_3 = torch.nn.Linear(16,1)
-        # # nonlinear transforms
-        # self.nonlinear = torch.nn.Tanh()
-        
-        # self.models = torch.nn.ModuleList([torch.nn.Sequential(
-        #     self.lin_1, self.nonlinear, self.lin_2, self.nonlinear, self.lin_3)
-        #     for k in range(n_tilt_types)])
-        
+                        
         self.models = torch.nn.ModuleList([
             torch.nn.Sequential(
                 torch.nn.Linear(1, 1),
@@ -206,141 +104,73 @@ class ANN(torch.nn.Module):
         ])
         
                 
-    def forward(self, tilt_types, x):
+    def forward(self, tilt_type, x):
         # Reshape to account for batch shape
-        x = x.reshape([-1, n_edge_max])
-        tilt_types = tilt_types.reshape([-1])
+        x = x.reshape([n_edge_max, -1])
+        
+        
+        nonlinear_drift = self.models[tilt_type](x)
+        
+        
+        # tilt_types = tilt_types.reshape([-1])
 
         # Choose model based on tilt type and apply
-        n_obs, n_edge = x.shape
-        nonlinear_drift = torch.zeros([n_obs, n_edge])
-        for tt in range(n_tilt_types):
+        # n_obs, n_edge = x.shape
+        # nonlinear_drift = torch.zeros([n_obs, n_edge])
+        # for tt in range(n_tilt_types):
             # Find observations of this tilt type
-            mask = (tilt_types == tt)
+            # mask = (tilt_types == tt)
             
             # Shape x inputs and pass
-            x_masked = x[mask,:].reshape([-1,1])      
-            nonlinear_drift[mask,:] = self.models[tt](x_masked).reshape([-1, n_edge_max])
+            # x_masked = x[mask,:].reshape([-1,1])      
+            # nonlinear_drift[mask,:] = self.models[tt](x_masked).reshape([-1, n_edge_max])
             
         return nonlinear_drift
+
 
 tilt_ann = ANN()
 
 def add_tilt_effect(tilt_type_list, n_meas, n_meas_max, n_edge_rod_k, n_edge_max):
     # ANN nonlinear effect dependent on tilt type
-    x = (1/n_edge_rod_k)*torch.arange(0, n_edge_max) # TODO! This should be of dim n_obs, n_edge, not 1, n_edge 
     tilt_series = torch.zeros(n_meas_max, n_edge_max)
+    x = (1/n_edge_rod_k)*torch.arange(0, n_edge_max) 
+    # TODO! This should be of dim n_obs, n_edge, not 1, n_edge,... or maybe this is already done correctly
+    # but is maybe the dim wrong, gets batched over firs or second dim in fwd?
+    # xx = x.repeat([len(tilt_type_list),1])
     
     for k, tilt_type in enumerate(tilt_type_list):
         tilt_series[k,:] = tilt_ann(tilt_type, x)
     
     return tilt_series
 
-# i) Chain together the effects
-# This will lead to a probabilistic model of the following type
-# 
-# mu_alpha = unknown_param      [n_rod, 2]
-# sigma_alpha = unknown param   [n_rod, 2,2]
-# alpha ~ N(mu_alpha, sigma_alpha)  [n_rod,2]
-# tilt_effect = f(measurement)      [n_rod, n_meas]
-# mu_edge = alpha[0] + alpha[1]*x + tilt_effect     [n_rod, n_meas, n_edge]
-# sigma_edge = unknown_param    [1]
-# edge_obs ~ N(mu_edge, sigma_edge) [n_rod, n_meas, n_edge]
-#
-# i.e. in words: For each class, there exist some production distribution with
-# unknown params. Each rod is sampled from one of these production distributions.
-# Each rod was sampled a variable number n_meas of times; different conditions
-# lead to different means for the observed edge positions. In the end, we get
-# an edge series for each measurement of each rod.
 
 def model(input_vars, observations = None):
     # Mark the parameters inside of the ann for optimization
     pyro.module("tilt_ann", tilt_ann)
     
-    # mu_edge   = torch.zeros(n_staff, n_meas_max, n_edge_max)   # dummy, fill in below
-    # mask_edge = torch.zeros(n_staff, n_meas_max, n_edge_max, dtype=torch.bool)
-    
-    # Plate setup
-    # type_plate = pyro.plate('type_plate', size = n_types)
-    # rod_plate = pyro.plate('rod_plate', size = n_staff)
-    meas_plate = pyro.plate('meas_plate', size = n_meas_max, dim = -2)
-    edge_plate = pyro.plate('edge_plate', size = n_edge_max, dim = -1)
-
     # General params
     sigma_cal = pyro.param("sigma_cal", init_tensor = 10 * torch.eye(1),
                    constraint = pyro.distributions.constraints.positive)
- 
-
-    # Staff setup
-    # Different production mean and cov params per staff type
-    mu_alpha = pyro.param('mu_alpha_prod', init_tensor = torch.zeros([n_types,2]))
-    Sigma_alpha = pyro.param('Sigma_alpha_prod', init_tensor = 1000 * (torch.eye(2).unsqueeze(0)).expand([n_types,2,2]),
-                       constraint = pyro.distributions.constraints.positive_definite)
-
-    # Different latent alpha per staff id
     
-    mu_alpha_extended =  mu_alpha[id_class_indices,:]
-    Sigma_alpha_extended = Sigma_alpha[id_class_indices,:,:]
-    alpha_dist = pyro.distributions.MultivariateNormal(loc = mu_alpha_extended,
-                                                       covariance_matrix = Sigma_alpha_extended)
-    with pyro.plate('rod_plate_vect', size = n_staff):
-        alpha = pyro.sample('alpha_rods', alpha_dist)
-        
+    # Addition of tilt effect
+    with pyro.plate('obs_plate', size = n_obs, dim = -1) as k:
+        # Set up drifts
+        tilt_types_k = tilt_types_perobs[k]    
+        nonlinear_drift = add_tilt_effect(tilt_types_k, 2, 2, n_edge_max, n_edge_max)
+        drift_vals = [nonlinear_drift[0], nonlinear_drift[1]]
     
-    # Observations
-    obs_dict = {}
-    for rod_k in pyro.plate('rod_plate', size = n_staff):
-        rod_alpha = alpha[rod_k,:]
-        n_meas_rod_k = n_meas_perstaff[rod_k]
-        n_edge_rod_k = n_edge_perstaff[rod_k]
+        # Add some noise
+        noise_dist_0 = pyro.distributions.Normal(loc = drift_vals[0], scale = sigma_cal)
+        noise_dist_1 = pyro.distributions.Normal(loc = drift_vals[1], scale = sigma_cal)
         
-        indices_obs_rod_k = torch.tensor(obsnr_perstaff[rod_k])
-        x_staff_rod_k = staff_len_perstaff[rod_k] * (1/n_edge_rod_k)*torch.arange(0, n_edge_max)
+        obs0_or_None = observations[0] if observations is not None else None 
+        obs1_or_None = observations[1] if observations is not None else None
         
-        with meas_plate:
-            # print(rod_k)
-            tilt_effect = add_tilt_effect(tilt_type_perstaff[rod_k], n_meas_rod_k,
-                                          n_meas_max, n_edge_rod_k, n_edge_max)
-            
-            with edge_plate:
-                # different edge, different impact of alpha
-                mu_edge =  rod_alpha[0] + rod_alpha[1]*x_staff_rod_k
-                
-                # Extend to proper shape [n_meas_max, n_edge_max] pre-masking
-                extension_tensor = torch.ones([n_meas_max, 1])
-                mu_extended = extension_tensor * mu_edge.unsqueeze(0) + tilt_effect
-                
-                # mask construction: mask_tensor of shape [n_meas_max, n_edge_max]
-                #    dim edge_plate True till n_edge_rod_k
-                #    dim meas_plate True till n_meas_rod_k
-                mask_tensor = torch.zeros([n_meas_max, n_edge_max])
-                mask_tensor[0:n_meas_rod_k,0:n_edge_rod_k] = 1
-                mask_tensor = mask_tensor.bool()
-                
-                # Set up obs
-                # obs_or_none = observations[indices_obs_rod_k] if observations is not None else None
-                obs_full = torch.zeros((n_meas_max, n_edge_max))
-                if observations is not None:
-                    obs_raw = observations[indices_obs_rod_k, :n_edge_rod_k]  # shape [n_meas_rod_k, n_edge_rod_k]
-                    obs_full[:n_meas_rod_k, :n_edge_rod_k] = obs_raw
-                    obs_or_none = obs_full
-                else:
-                    obs_or_none = None
-                    
-                # Build masked distribution
-                edge_dist = (pyro.distributions.Normal(loc = mu_extended,scale = sigma_cal)
-                             .mask(mask_tensor))
-                edge_obs = pyro.sample('edge_obs_r{}'.format(rod_k), edge_dist, obs = obs_or_none)
-                masked_obs = edge_obs.masked_fill(~mask_tensor, float("nan"))
-        
-        obs_dict[rod_k] = masked_obs
+        noisy_obs_0 = pyro.sample('noise_0', noise_dist_0, bs = obs0_or_None)
+        noisy_obs_1 = pyro.sample('noise_1', noise_dist_1, bs = obs1_or_None)
     
-    observation_list = []
-    for k in range(n_obs):
-        rod_k, idx = obs_idx_lookup[k]
-        observation_list.append(obs_dict[rod_k][idx])
-    
-    return obs_dict, observation_list
+    output = [noisy_obs_0, noisy_obs_1]
+    return output
 
 
 
@@ -352,20 +182,7 @@ def model(input_vars, observations = None):
 # i) Build the guide
 
 def guide(input_vars, observations = None):
-    # Guide contains posterior distributions for the unobserved latents, i.e.
-    # the alphas for each rod
-    
-    # Set up posterior parameters
-    mu_alpha_post = pyro.param("mu_alpha_post", init_tensor = 10*torch.ones([n_staff, 2]))
-    Sigma_alpha_post = pyro.param("Sigma_alpha_post", init_tensor = 1000 * (torch.eye(2).unsqueeze(0)).expand([n_staff,2,2]),
-                       constraint = pyro.distributions.constraints.positive_definite)  
-    
-    # Sample from posterior distribution
-    alpha_post_dist = pyro.distributions.MultivariateNormal(loc = mu_alpha_post,
-                                            covariance_matrix = Sigma_alpha_post)
-    with pyro.plate("rod_plate", size = n_staff):
-        alpha_post_sample = pyro.sample('alpha_rods', alpha_post_dist)
-    return alpha_post_sample
+    pass
     
     
     
@@ -395,40 +212,6 @@ posterior_pretrain_dict = predictive(guide, num_samples = n_guide_samples)(input
 posterior_predictive_pretrain_dict = predictive(model, guide = guide, num_samples = n_model_samples)(input_vars)
 
 
-# Build tensor from sequential edge obs
-def build_tensor_from_dict(obs_dict):
-    keys = [key for key in obs_dict.keys() if 'obs' in key]
-    data_tensor =  torch.zeros([n_model_samples, n_meas_max*n_staff, n_edge_max])
-    k=0
-    for key in keys:
-        data_tensor[:, k*n_meas_max : (k+1)*n_meas_max] = obs_dict[key]
-        k = k + 1
-    return data_tensor
-
-
-# evaluate per-id and per-class data
-def build_dicts_from_data(data):
-    data_dict_class = {}
-    for class_idx, class_name in index_to_type.items():
-        # Find obs indices belonging to this class
-        obs_mask = (obs_class_indices == class_idx)                   # [n_obs] boolean
-        obs_indices = obs_mask.nonzero(as_tuple=True)[0]              # [n_types]
-    
-        # Select and stack observations for this class
-        data_dict_class[class_name] = data[:, obs_indices, :]
-        
-    data_dict_id = {}
-    for staff_id in id_class_indices_dict.keys():
-        # Find obs indices belonging to this staff_id
-        obs_mask = (obs_id_indices == staff_id)                     # [n_obs] boolean
-        obs_indices = obs_mask.nonzero(as_tuple=True)[0]            # [n_ids]
-    
-        # Select and stack observations for this class
-        data_dict_id[staff_id] = data[:, obs_indices, :]
-        
-    return {'data_dict_class' : data_dict_class,
-            'data_dict_id' : data_dict_id}
-
 
 
 
@@ -447,7 +230,7 @@ svi = pyro.infer.SVI(model, guide, adam, elbo)
 
 # ii) Perform svi
 
-data = (input_vars, observations)
+data = (input_vars, observations_perstaff)
 loss_sequence = []
 for step in range(100):
     loss = svi.step(*data)

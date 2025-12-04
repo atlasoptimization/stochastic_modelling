@@ -44,15 +44,14 @@ from pathlib import Path
 # ii) Definitions
 
 n_calibs = 100                  # nr of calibration measurements
-n_staff_class_range = [5,10]    # range of nr of staff classes
+n_staff_class_range = [2,3]     # range of nr of staff classes
 n_staffs_range = [25, 75]       # range of nr of staffs that are measured
 n_meas_range = [1, 5]           # range of nr of measurements per staff
 n_edges_range = [50,100]        # range of nr of edges for rodtypes
 n_dots_range = [100,200]        # range of nr of measurements on each edge
 
 # torch.random.seed(42)
-pyro.set_rng_seed(1)
-
+pyro.set_rng_seed(0)
 
 # iii) Metadistribution for staff class alpha
 
@@ -195,9 +194,9 @@ def add_tilt_effect(tilt_type_list, n_meas, n_meas_max, n_edge_rod_k, n_edge_max
         if tilt_type == 0:
             pass
         elif tilt_type == 1:
-            tilt_series[k, 0:n_edge_rod_k] = 50* x**2
+            tilt_series[k, 0:n_edge_rod_k] = -1000* ((x-1)**2 + (x-1)**3)
         elif tilt_type == 2:
-            tilt_series[k, 0:n_edge_rod_k] = -50* x**2
+            tilt_series[k, 0:n_edge_rod_k] = 1000* ((x-1)**2 + (x-1)**3)
     
     return tilt_series
     
@@ -442,6 +441,9 @@ job_nr_list = []
 staff_id = 0
 staff_id_list = []
 
+n_meas_max = max(staff.n_meas for staff in staff_list)
+n_edge_max = max(staff.n_edge for staff in staff_list)
+
 data_list = []
 for staff in staff_list:
     for meas in range(staff.n_meas):
@@ -452,7 +454,9 @@ for staff in staff_list:
         overall_offset = staff.alpha_staff[0]
         overall_scale = staff.alpha_staff[1]
         edgeseries = data[str(staff_id)][meas,:]
+
         tilt_type = staff.tilt_types[meas]
+        tilt_impact = add_tilt_effect([tilt_type], staff.n_meas, n_meas_max, staff.n_edge, n_edge_max)[0,:]
         
         # Save in data_list
         datapoint_dict_temp = {'job_nr' : job_nr,
@@ -462,7 +466,8 @@ for staff in staff_list:
                                'gt_offset' : overall_offset,
                                'gt_scale' : overall_scale,
                                'edgeseries' : edgeseries,
-                               'tilt_type' : tilt_type}
+                               'tilt_type' : tilt_type,
+                               'gt_tiltseries' : tilt_impact}
         data_list.append(datapoint_dict_temp)
         job_nr += 1
         job_nr_list.append(str(job_nr))
